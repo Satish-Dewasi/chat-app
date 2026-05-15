@@ -1,45 +1,20 @@
 #include "client.h"
 
 // ═══════════════════════════════════════════════════════════════════
-//  connectToServer()
-//  Goal: Create a socket and connect it to the server
-//  Compare with server: server does socket→bind→listen→accept
-//                       client does socket→connect  (much simpler)
+//  connectToServer() — unchanged from Phase 4
 // ═══════════════════════════════════════════════════════════════════
 int connectToServer(const std::string& server_ip, int port)
 {
-    // ── STEP 1: socket() ───────────────────────────────────────────
-    // Identical to the server — we need a socket fd too
-    // AF_INET = IPv4, SOCK_STREAM = TCP, 0 = let OS pick protocol
     int sock_fd = socket(AF_INET, SOCK_STREAM, 0);
-
     if (sock_fd == -1) {
         std::cerr << "[ERROR] socket() failed\n";
         return -1;
     }
-    std::cout << "[INFO] Socket created. fd = " << sock_fd << "\n";
 
-    // ── STEP 2: connect() ─────────────────────────────────────────
-    // This is what the CLIENT has instead of bind+listen+accept.
-    // connect() says: "reach out to THIS specific server address"
-    //
-    // It triggers the TCP 3-way handshake:
-    //   Client → SYN       → Server
-    //   Client ← SYN-ACK   ← Server
-    //   Client → ACK       → Server
-    // After this, the connection is established and data can flow.
-    //
-    // We fill the same sockaddr_in struct — but this time it holds
-    // the SERVER's address (not our own address like in bind())
     struct sockaddr_in server_addr;
     memset(&server_addr, 0, sizeof(server_addr));
-
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port   = htons(port);
-
-    // inet_addr() converts a human-readable IP string like "127.0.0.1"
-    // into the 32-bit binary format the OS understands
-    // It's the reverse of inet_ntoa() which we used in the server
+    server_addr.sin_family      = AF_INET;
+    server_addr.sin_port        = htons(port);
     server_addr.sin_addr.s_addr = inet_addr(server_ip.c_str());
 
     if (server_addr.sin_addr.s_addr == INADDR_NONE) {
@@ -48,117 +23,133 @@ int connectToServer(const std::string& server_ip, int port)
         return -1;
     }
 
-    std::cout << "[INFO] Connecting to " << server_ip << ":" << port << "...\n";
-
-    // connect() BLOCKS until the handshake completes or fails
-    // If the server isn't running → "Connection refused" error
-    // If server is unreachable  → times out after ~75 seconds
     if (connect(sock_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) == -1) {
         std::cerr << "[ERROR] connect() failed — is the server running?\n";
         close(sock_fd);
         return -1;
     }
 
-    std::cout << "[INFO] Connected to server successfully!\n";
-    std::cout << "─────────────────────────────────────────\n";
-    std::cout << "  Type a message and press Enter to send  \n";
-    std::cout << "  Type 'exit' to disconnect               \n";
-    std::cout << "─────────────────────────────────────────\n";
-
     return sock_fd;
 }
 
 
 // ═══════════════════════════════════════════════════════════════════
-//  runPhase2Loop()
-//  Goal: Simple send → receive → send → receive loop
-//
-//  LIMITATION (intentional for Phase 2):
-//  This is SEQUENTIAL — we send, then we wait for reply, then repeat.
-//  Problem: what if the server sends a message we didn't ask for?
-//           (e.g. another client's broadcast in Phase 3)
-//           We'd miss it because we're stuck waiting for user input.
-//  Fix: Phase 4 solves this with select() on the client side too.
+//  sendAll() — client side robust send, mirrors the server's version
 // ═══════════════════════════════════════════════════════════════════
-void runPhase2Loop(int sock_fd)
+bool sendAll(int fd, const std::string& message)
 {
-    char    recv_buffer[BUFFER_SIZE];   // for incoming data from server
-    std::string user_input;             // for what the user types
+    const char* data       = message.c_str();
+    int         total      = message.size();
+    int         sent_so_far = 0;
+
+    while (sent_so_far < total)
+    {
+        int bytes = send(fd, data + sent_so_far, total - sent_so_far, 0);
+        if (bytes == -1) return false;
+        sent_so_far += bytes;
+    }
+    return true;
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  runPhase5Loop()
+//  Identical select() logic to Phase 4
+//  Only difference: messages are formatted as "username: text"
+//  which the server now does — client just sends raw text
+// ═══════════════════════════════════════════════════════════════════
+void runPhase5Loop(int sock_fd)
+{
+    char net_buffer[BUFFER_SIZE];
+    char kbd_buffer[BUFFER_SIZE];
+    int  max_fd = sock_fd;
 
     while (true)
     {
-        // ── Read from keyboard ────────────────────────────────────
-        // std::getline() reads a full line from stdin (the keyboard)
-        // It BLOCKS here until the user presses Enter
-        std::cout << "You: ";
-        std::cout.flush(); // make sure "You: " appears before user types
+        fd_set read_fds;
+        FD_ZERO(&read_fds);
+        FD_SET(STDIN_FILENO, &read_fds);
+        FD_SET(sock_fd,      &read_fds);
 
-        if (!std::getline(std::cin, user_input)) {
-            // getline fails if stdin closes (e.g. Ctrl+D)
-            std::cout << "\n[INFO] Input closed. Disconnecting...\n";
+        int activity = select(max_fd + 1, &read_fds, NULL, NULL, NULL);
+        if (activity == -1) {
+            if (errno == EINTR) continue; // signal interrupted — retry
+            std::cerr << "[ERROR] select() failed\n";
             break;
         }
 
-        // ── Check for exit command ────────────────────────────────
-        if (user_input == "exit" || user_input == "quit") {
-            std::cout << "[INFO] Disconnecting...\n";
-            break;
+        // ── Server sent something ─────────────────────────────────
+        if (FD_ISSET(sock_fd, &read_fds))
+        {
+            memset(net_buffer, 0, BUFFER_SIZE);
+            int bytes = recv(sock_fd, net_buffer, BUFFER_SIZE - 1, 0);
+
+            if (bytes == 0) {
+                std::cout << "\n[INFO] Server disconnected.\n";
+                break;
+            }
+            if (bytes == -1) {
+                std::cerr << "\n[ERROR] recv() failed.\n";
+                break;
+            }
+
+            // \r clears any partial text user may have typed
+            std::cout << "\r" << net_buffer;
+            std::cout << "You: ";
+            std::cout.flush();
         }
 
-        // ── Skip empty messages ───────────────────────────────────
-        if (user_input.empty()) {
-            continue;
+        // ── User typed something ──────────────────────────────────
+        if (FD_ISSET(STDIN_FILENO, &read_fds))
+        {
+            memset(kbd_buffer, 0, BUFFER_SIZE);
+
+            if (fgets(kbd_buffer, BUFFER_SIZE, stdin) == NULL) {
+                std::cout << "\n[INFO] Input closed.\n";
+                break;
+            }
+
+            // Strip trailing newline
+            int len = strlen(kbd_buffer);
+            if (len > 0 && kbd_buffer[len-1] == '\n') {
+                kbd_buffer[len-1] = '\0';
+                len--;
+            }
+
+            if (strcmp(kbd_buffer, "exit") == 0 ||
+                strcmp(kbd_buffer, "quit") == 0) {
+                std::cout << "[INFO] Disconnecting...\n";
+                break;
+            }
+
+            if (len == 0) continue;
+
+            // Send raw text — server prepends "username: " for us
+            if (!sendAll(sock_fd, std::string(kbd_buffer) + "\n")) {
+                std::cerr << "[ERROR] sendAll() failed.\n";
+                break;
+            }
         }
-
-        // ── STEP 3: send() ────────────────────────────────────────
-        // send(fd, data_pointer, data_length, flags)
-        // flags = 0 → default behaviour, no special options
-        //
-        // Returns bytes actually sent.
-        // Could be less than requested on congested networks —
-        // we'll add a robust send() helper in Phase 5.
-        // For now, assume it sends everything.
-        int bytes_sent = send(sock_fd, user_input.c_str(), user_input.size(), 0);
-
-        if (bytes_sent == -1) {
-            std::cerr << "[ERROR] send() failed. Server may have closed.\n";
-            break;
-        }
-
-        // ── STEP 4: recv() ────────────────────────────────────────
-        // Now wait for the server's reply
-        // This BLOCKS until the server sends something back
-        memset(recv_buffer, 0, BUFFER_SIZE);
-        int bytes_received = recv(sock_fd, recv_buffer, BUFFER_SIZE - 1, 0);
-
-        if (bytes_received == 0) {
-            // Server closed the connection from its side
-            std::cout << "[INFO] Server disconnected.\n";
-            break;
-        }
-
-        if (bytes_received == -1) {
-            std::cerr << "[ERROR] recv() failed.\n";
-            break;
-        }
-
-        // Print the server's reply
-        std::cout << "Server: " << recv_buffer << "\n";
     }
 }
 
 
 // ═══════════════════════════════════════════════════════════════════
 //  main()
-//  Usage: ./chat_client <server_ip> <port>
-//  e.g.   ./chat_client 127.0.0.1 8080
+//  NEW in Phase 5: username handshake
+//
+//  Flow after connect():
+//    Server sends: "[SERVER] Enter your username: "
+//    Client receives it (via select loop or directly)
+//    Client prompts user locally
+//    Client sends chosen username to server
+//    Server stores it, sends welcome message
+//    Normal chat begins
 // ═══════════════════════════════════════════════════════════════════
 int main(int argc, char* argv[])
 {
-    // Validate arguments
     if (argc < 3) {
         std::cerr << "[USAGE] ./chat_client <server_ip> <port>\n";
-        std::cerr << "        ./chat_client 127.0.0.1 8080\n";
         return 1;
     }
 
@@ -166,19 +157,62 @@ int main(int argc, char* argv[])
     int         port      = std::stoi(argv[2]);
 
     std::cout << "╔══════════════════════════════╗\n";
-    std::cout << "║   TCP Chat Client — Phase 2  ║\n";
+    std::cout << "║   TCP Chat Client — Phase 5  ║\n";
     std::cout << "╚══════════════════════════════╝\n";
 
-    // Connect to the server
+    // Connect to server
     int sock_fd = connectToServer(server_ip, port);
     if (sock_fd == -1) return 1;
+    std::cout << "[INFO] Connected to " << server_ip << ":" << port << "\n";
 
-    // Start the chat loop
-    runPhase2Loop(sock_fd);
+    // ── USERNAME HANDSHAKE ────────────────────────────────────────
+    // Step 1: receive the server's username prompt
+    char prompt_buf[BUFFER_SIZE];
+    memset(prompt_buf, 0, BUFFER_SIZE);
+    int bytes = recv(sock_fd, prompt_buf, BUFFER_SIZE - 1, 0);
+    if (bytes <= 0) {
+        std::cerr << "[ERROR] Server closed before username prompt.\n";
+        close(sock_fd);
+        return 1;
+    }
+    // Print server's prompt: "[SERVER] Enter your username: "
+    std::cout << prompt_buf;
+    std::cout.flush();
 
-    // Always close the socket cleanly
-    // This sends a TCP FIN → server's recv() will return 0
+    // Step 2: user types their username locally
+    char username[USERNAME_SIZE];
+    memset(username, 0, USERNAME_SIZE);
+    if (fgets(username, USERNAME_SIZE, stdin) == NULL) {
+        close(sock_fd);
+        return 1;
+    }
+    // Strip newline
+    int ulen = strlen(username);
+    if (ulen > 0 && username[ulen-1] == '\n') username[ulen-1] = '\0';
+
+    // Step 3: send username to server
+    if (!sendAll(sock_fd, std::string(username) + "\n")) {
+        std::cerr << "[ERROR] Failed to send username.\n";
+        close(sock_fd);
+        return 1;
+    }
+
+    // Step 4: receive welcome message from server
+    memset(prompt_buf, 0, BUFFER_SIZE);
+    bytes = recv(sock_fd, prompt_buf, BUFFER_SIZE - 1, 0);
+    if (bytes > 0) std::cout << prompt_buf;
+
+    // ── Chat begins ───────────────────────────────────────────────
+    std::cout << "─────────────────────────────────────────\n";
+    std::cout << "  Type a message + Enter to send          \n";
+    std::cout << "  Type 'exit' to disconnect               \n";
+    std::cout << "─────────────────────────────────────────\n";
+    std::cout << "You: ";
+    std::cout.flush();
+
+    runPhase5Loop(sock_fd);
+
     close(sock_fd);
-    std::cout << "[INFO] Socket closed. Goodbye.\n";
+    std::cout << "[INFO] Goodbye.\n";
     return 0;
 }

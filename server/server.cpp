@@ -1,8 +1,104 @@
 #include "server.h"
 
+// ── Global flag ────────────────────────────────────────────────────
+// Starts as 1 (true = keep running)
+// signalHandler sets it to 0 when Ctrl+C is pressed
+// The main select() loop checks this every iteration
+volatile sig_atomic_t g_running = 1;
+
+
 // ═══════════════════════════════════════════════════════════════════
-//  createServerSocket()
-//  Identical to Phase 1 — nothing changes here
+//  signalHandler()
+//  Called automatically by the OS when Ctrl+C (SIGINT) is pressed
+//
+//  Rules for signal handlers — they must be simple:
+//  - No cout/printf (not signal-safe)
+//  - No malloc/new
+//  - Only set flags — let the main loop do the real cleanup
+//  - write() is signal-safe, cout is NOT
+// ═══════════════════════════════════════════════════════════════════
+void signalHandler(int signal)
+{
+    if (signal == SIGINT) {
+        // Signal-safe way to print — write() is allowed, cout is not
+        const char* msg = "\n[SERVER] Ctrl+C received. Shutting down...\n";
+        write(STDOUT_FILENO, msg, strlen(msg));
+        g_running = 0;  // tell the main loop to stop
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  sendAll()
+//  Problem: send() does not guarantee all bytes are sent in one call
+//
+//  Why does this happen?
+//  send() writes to the kernel's socket send buffer. If that buffer
+//  is temporarily full (network congestion, slow receiver), the OS
+//  only accepts as many bytes as fit right now and returns that count.
+//  The rest of your data is silently ignored — you must retry.
+//
+//  Example without sendAll():
+//    send(fd, "Hello World", 11, 0) → returns 6
+//    Only "Hello " was sent. " World" was dropped silently.
+//
+//  sendAll() loops until every byte is delivered:
+// ═══════════════════════════════════════════════════════════════════
+bool sendAll(int fd, const std::string& message)
+{
+    // c_str() gives a const char* pointer to the string's data
+    const char* data      = message.c_str();
+    int         total     = message.size();  // total bytes to send
+    int         sent_so_far = 0;             // bytes sent so far
+
+    while (sent_so_far < total)
+    {
+        // Send from wherever we left off last iteration
+        // data + sent_so_far → pointer arithmetic, moves start forward
+        int bytes = send(fd, data + sent_so_far, total - sent_so_far, 0);
+
+        if (bytes == -1) {
+            // Real error — connection broken
+            return false;
+        }
+
+        sent_so_far += bytes;
+        // Loop continues if sent_so_far < total (partial send happened)
+    }
+
+    return true; // all bytes delivered
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  broadcastMessage()
+//  UPGRADED from Phase 3:
+//  - Now uses sendAll() instead of send()
+//  - Message format already contains sender's name (built by caller)
+// ═══════════════════════════════════════════════════════════════════
+void broadcastMessage(const std::vector<int>&         client_fds,
+                      const std::map<int,std::string>& usernames,
+                      int                              sender_fd,
+                      const std::string&               message)
+{
+    for (int fd : client_fds)
+    {
+        if (fd == sender_fd) continue;  // don't echo back to sender
+
+        if (!sendAll(fd, message)) {
+            // Log but don't crash — select() loop handles the broken fd
+            std::string name = "unknown";
+            auto it = usernames.find(fd);
+            if (it != usernames.end()) name = it->second;
+            std::cerr << "[WARN] sendAll() failed for " << name
+                      << " (fd " << fd << ")\n";
+        }
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  createServerSocket() — unchanged from Phase 3
 // ═══════════════════════════════════════════════════════════════════
 int createServerSocket(int port)
 {
@@ -39,224 +135,220 @@ int createServerSocket(int port)
 
 
 // ═══════════════════════════════════════════════════════════════════
-//  broadcastMessage()
-//  Send a message to every connected client EXCEPT the sender
-//
-//  Why exclude the sender?
-//  The sender already sees their own message on their own screen.
-//  Sending it back to them would print it twice — confusing.
-// ═══════════════════════════════════════════════════════════════════
-void broadcastMessage(const std::vector<int>& client_fds,
-                      int                     sender_fd,
-                      const std::string&      message)
-{
-    for (int fd : client_fds)
-    {
-        // Skip the sender — they don't need their own message echoed back
-        if (fd == sender_fd) continue;
-
-        int bytes_sent = send(fd, message.c_str(), message.size(), 0);
-
-        if (bytes_sent == -1) {
-            // This client's connection may have broken
-            // We log it but don't crash — the select() loop will
-            // detect the broken fd on the next iteration
-            std::cerr << "[WARN] send() failed for fd " << fd << "\n";
-        }
-    }
-}
-
-
-// ═══════════════════════════════════════════════════════════════════
 //  runSelectLoop()
-//  The core of Phase 3 — one loop, many clients, no threads
+//  UPGRADED from Phase 3:
 //
-//  Key data structures:
+//  NEW: std::map<int, std::string> usernames
+//       Maps each fd to the username that client chose
+//       e.g. {4: "Alice", 5: "Bob", 6: "Charlie"}
 //
-//  client_fds  → std::vector<int>
-//                tracks all currently connected client file descriptors
-//                grows when clients connect, shrinks when they leave
+//  NEW: Username handshake
+//       First message from any new client = their chosen username
+//       Server stores it, then announces them to the room
 //
-//  read_fds    → fd_set
-//                a SET of file descriptors select() watches for READ activity
-//                "read activity" means: data arrived OR new connection arrived
-//
-//  max_fd      → the highest fd number in our watch set
-//                select() needs this to know how far to scan
+//  NEW: g_running check — loop exits cleanly on Ctrl+C
+//  NEW: sendAll() used everywhere instead of send()
+//  NEW: Graceful shutdown — notifies all clients before closing
 // ═══════════════════════════════════════════════════════════════════
 void runSelectLoop(int server_fd)
 {
-    // Our dynamic list of connected client fds
-    // Starts empty — clients join as they connect
-    std::vector<int> client_fds;
+    std::vector<int>             client_fds;  // connected client fds
+    std::map<int, std::string>   usernames;   // fd → username
 
     char buffer[BUFFER_SIZE];
 
-    std::cout << "[INFO] Waiting for clients...\n";
+    std::cout << "[INFO] Waiting for clients. Press Ctrl+C to shut down.\n";
     std::cout << "─────────────────────────────────────────\n";
 
-    // ── THE MAIN EVENT LOOP ───────────────────────────────────────
-    // This loop runs FOREVER — every iteration is one "event"
-    // An event is: new client connects OR existing client sends data
-    while (true)
+    // ── MAIN EVENT LOOP ───────────────────────────────────────────
+    // g_running starts as 1. Signal handler sets it to 0 on Ctrl+C.
+    while (g_running)
     {
-        // ── BUILD THE WATCH SET ───────────────────────────────────
-        // fd_set is a fixed-size bit array (1024 bits on Linux)
-        // Each bit represents one fd — 1 = watch it, 0 = ignore it
-        //
-        // We MUST rebuild this every iteration because select()
-        // MODIFIES the fd_set to show which fds are ready.
-        // If we don't rebuild, we lose track of fds that weren't ready.
+        // ── Build watch set ───────────────────────────────────────
         fd_set read_fds;
-        FD_ZERO(&read_fds);              // zero out all bits — start clean
+        FD_ZERO(&read_fds);
+        FD_SET(server_fd, &read_fds);
+        int max_fd = server_fd;
 
-        // Always watch the server fd — new clients might connect
-        FD_SET(server_fd, &read_fds);    // set server_fd's bit to 1
-        int max_fd = server_fd;          // track the highest fd number
-
-        // Watch every connected client fd too
-        for (int fd : client_fds)
-        {
+        for (int fd : client_fds) {
             FD_SET(fd, &read_fds);
-            if (fd > max_fd) max_fd = fd;   // update max if this fd is bigger
+            if (fd > max_fd) max_fd = fd;
         }
 
-        // ── CALL select() ─────────────────────────────────────────
-        // select(max_fd + 1, &read_fds, NULL, NULL, NULL)
+        // ── select() with a timeout ───────────────────────────────
+        // NEW in Phase 5: we give select() a 1-second timeout
+        // instead of NULL (block forever).
         //
-        // Argument breakdown:
-        //   max_fd + 1   → scan fds from 0 up to max_fd (inclusive)
-        //                  +1 because it's an exclusive upper bound
-        //   &read_fds    → watch these fds for READ activity
-        //   NULL         → not watching for WRITE activity
-        //   NULL         → not watching for ERRORS (separately)
-        //   NULL         → no timeout — block FOREVER until activity
+        // Why? If we block forever and Ctrl+C is pressed, select()
+        // gets interrupted (returns -1, errno = EINTR). The loop
+        // would then check g_running = 0 and exit cleanly.
+        // But with a timeout, we check g_running every second even
+        // if no network activity happens — more responsive shutdown.
         //
-        // select() MODIFIES read_fds:
-        //   BEFORE: read_fds = {server_fd, A_fd, B_fd}   (all we watch)
-        //   AFTER:  read_fds = {A_fd}                    (only A has data)
-        //
-        // Returns: number of fds that are ready (-1 = error)
-        int activity = select(max_fd + 1, &read_fds, NULL, NULL, NULL);
+        // timeval: { seconds, microseconds }
+        struct timeval timeout;
+        timeout.tv_sec  = 1;   // wake up every 1 second at minimum
+        timeout.tv_usec = 0;
+
+        int activity = select(max_fd + 1, &read_fds, NULL, NULL, &timeout);
 
         if (activity == -1) {
+            // EINTR means a signal interrupted select() — not a real error
+            // Just loop back and check g_running
+            if (errno == EINTR) continue;
             std::cerr << "[ERROR] select() failed\n";
             break;
         }
 
-        // ── CHECK: IS server_fd READY? ────────────────────────────
-        // If server_fd is in the ready set, a NEW client is connecting
-        // FD_ISSET checks if a specific fd's bit is set in read_fds
+        // Timeout expired with no activity — loop back, check g_running
+        if (activity == 0) continue;
+
+        // ── New client connecting ─────────────────────────────────
         if (FD_ISSET(server_fd, &read_fds))
         {
-            // A new client knocked → accept() them
             struct sockaddr_in client_addr;
             socklen_t client_len = sizeof(client_addr);
             int new_fd = accept(server_fd,
                                (struct sockaddr*)&client_addr,
                                &client_len);
-
             if (new_fd == -1) {
                 std::cerr << "[ERROR] accept() failed\n";
-                continue; // don't crash, try again next iteration
-            }
-
-            // Enforce client limit
-            if ((int)client_fds.size() >= MAX_CLIENTS) {
-                std::string msg = "[SERVER] Chat is full. Try again later.\n";
-                send(new_fd, msg.c_str(), msg.size(), 0);
-                close(new_fd);
-                std::cout << "[INFO] Rejected client — server full\n";
                 continue;
             }
 
-            // Add new client to our tracking list
+            if ((int)client_fds.size() >= MAX_CLIENTS) {
+                std::string full = "[SERVER] Chat is full. Try later.\n";
+                sendAll(new_fd, full);
+                close(new_fd);
+                continue;
+            }
+
             client_fds.push_back(new_fd);
 
-            std::cout << "[CONNECT] New client → IP: "
-                      << inet_ntoa(client_addr.sin_addr)
-                      << "  Port: " << ntohs(client_addr.sin_port)
-                      << "  fd: " << new_fd
-                      << "  (Total clients: " << client_fds.size() << ")\n";
+            // ── USERNAME HANDSHAKE ────────────────────────────────
+            // We don't know this client's name yet.
+            // Store a placeholder — real name arrives as first message.
+            // The client is coded to send their username immediately
+            // after connecting, before any chat messages.
+            usernames[new_fd] = ""; // empty = "hasn't sent username yet"
 
-            // Welcome message to the new client
-            std::string welcome = "[SERVER] Welcome! "
-                                + std::to_string(client_fds.size())
-                                + " client(s) connected.\n";
-            send(new_fd, welcome.c_str(), welcome.size(), 0);
+            // Ask them for their name
+            std::string prompt = "[SERVER] Enter your username: ";
+            sendAll(new_fd, prompt);
 
-            // Announce to everyone else that someone joined
-            std::string announce = "[SERVER] A new client joined. (fd "
-                                 + std::to_string(new_fd) + ")\n";
-            broadcastMessage(client_fds, new_fd, announce);
+            std::cout << "[CONNECT] New connection → fd " << new_fd
+                      << "  IP: " << inet_ntoa(client_addr.sin_addr)
+                      << " (waiting for username)\n";
         }
 
-        // ── CHECK: WHICH CLIENT FDs ARE READY? ───────────────────
-        // We can't use range-based for loop here because we might
-        // need to REMOVE elements (disconnected clients) mid-loop.
-        // Use index-based loop with careful erase() handling.
+        // ── Check each client fd ──────────────────────────────────
         int i = 0;
         while (i < (int)client_fds.size())
         {
             int fd = client_fds[i];
 
-            if (FD_ISSET(fd, &read_fds))
+            if (!FD_ISSET(fd, &read_fds)) {
+                i++;
+                continue;
+            }
+
+            memset(buffer, 0, BUFFER_SIZE);
+            int bytes = recv(fd, buffer, BUFFER_SIZE - 1, 0);
+
+            // ── Client disconnected ───────────────────────────────
+            if (bytes <= 0)
             {
-                // This client has data waiting — read it
-                memset(buffer, 0, BUFFER_SIZE);
-                int bytes_received = recv(fd, buffer, BUFFER_SIZE - 1, 0);
+                std::string name = usernames.count(fd) ? usernames[fd] : "unknown";
 
-                if (bytes_received == 0)
-                {
-                    // ── Client disconnected gracefully ────────────
-                    // recv() returning 0 = client sent TCP FIN
-                    std::cout << "[DISCONNECT] fd " << fd
-                              << " disconnected. "
-                              << "(Remaining: " << client_fds.size() - 1
-                              << " client(s))\n";
+                if (name.empty()) name = "unnamed";
 
-                    // Announce departure to remaining clients
-                    std::string bye = "[SERVER] A client left. (fd "
-                                    + std::to_string(fd) + ")\n";
-                    broadcastMessage(client_fds, fd, bye);
+                std::cout << "[DISCONNECT] " << name
+                          << " (fd " << fd << ") left.\n";
 
-                    // Close the fd and remove from our list
-                    close(fd);
-                    // erase() removes the element and shifts others left
-                    // We do NOT increment i — the next element slides
-                    // into position i, so we check i again
-                    client_fds.erase(client_fds.begin() + i);
-                    continue; // skip the i++ at the bottom
+                // Announce departure only if they had a username
+                if (!name.empty() && name != "unnamed") {
+                    std::string bye = "[SERVER] " + name + " has left the chat.\n";
+                    broadcastMessage(client_fds, usernames, fd, bye);
                 }
 
-                if (bytes_received == -1)
-                {
-                    // ── Connection error ──────────────────────────
-                    std::cerr << "[ERROR] recv() failed on fd " << fd << "\n";
-                    close(fd);
-                    client_fds.erase(client_fds.begin() + i);
+                close(fd);
+                usernames.erase(fd);
+                client_fds.erase(client_fds.begin() + i);
+                continue; // don't increment i
+            }
+
+            // Remove trailing newline from received data
+            int len = strlen(buffer);
+            if (len > 0 && buffer[len-1] == '\n') buffer[len-1] = '\0';
+
+            // ── USERNAME HANDSHAKE — receive username ─────────────
+            // If this client's username is still empty,
+            // this first message IS their username
+            if (usernames[fd].empty())
+            {
+                std::string chosen_name(buffer);
+
+                // Basic validation — trim and reject blank names
+                if (chosen_name.empty()) {
+                    sendAll(fd, "[SERVER] Invalid username. Try again: ");
+                    i++;
                     continue;
                 }
 
-                // ── Valid message received — broadcast it ─────────
-                std::string message = "[fd " + std::to_string(fd)
-                                    + "]: " + std::string(buffer);
+                // Enforce max length
+                if (chosen_name.size() > USERNAME_SIZE) {
+                    chosen_name = chosen_name.substr(0, USERNAME_SIZE);
+                }
 
-                std::cout << "[MSG] " << message;
+                // Store the username
+                usernames[fd] = chosen_name;
 
-                // Send to all OTHER connected clients
-                broadcastMessage(client_fds, fd, message);
+                std::cout << "[JOIN] " << chosen_name
+                          << " joined the chat (fd " << fd << ").\n";
+
+                // Welcome the new user
+                std::string welcome = "[SERVER] Welcome, " + chosen_name
+                                    + "! " + std::to_string(client_fds.size())
+                                    + " user(s) in the chat.\n";
+                sendAll(fd, welcome);
+
+                // Announce to everyone else
+                std::string announce = "[SERVER] " + chosen_name
+                                     + " has joined the chat!\n";
+                broadcastMessage(client_fds, usernames, fd, announce);
+
+                i++;
+                continue;
             }
 
-            i++; // move to next client
+            // ── Normal chat message ───────────────────────────────
+            // Username is known — format and broadcast the message
+            std::string sender_name = usernames[fd];
+            std::string message     = sender_name + ": " + buffer + "\n";
+
+            // Print on server terminal too — useful for monitoring
+            std::cout << "[CHAT] " << message;
+
+            // Broadcast to everyone except sender
+            broadcastMessage(client_fds, usernames, fd, message);
+
+            i++;
         }
 
-    } // end while(true)
+    } // end while(g_running)
 
-    // Clean up — close all remaining client connections
+    // ── GRACEFUL SHUTDOWN ─────────────────────────────────────────
+    // Ctrl+C was pressed — notify all connected clients before closing
+    std::cout << "[INFO] Shutting down — notifying "
+              << client_fds.size() << " client(s)...\n";
+
+    std::string shutdown_msg = "[SERVER] Server is shutting down. Goodbye!\n";
     for (int fd : client_fds) {
+        sendAll(fd, shutdown_msg);
         close(fd);
     }
+
+    std::cout << "[INFO] All clients notified and disconnected.\n";
 }
 
 
@@ -268,8 +360,14 @@ int main(int argc, char* argv[])
     int port = (argc >= 2) ? std::stoi(argv[1]) : DEFAULT_PORT;
 
     std::cout << "╔══════════════════════════════╗\n";
-    std::cout << "║   TCP Chat Server — Phase 3  ║\n";
+    std::cout << "║   TCP Chat Server — Phase 5  ║\n";
     std::cout << "╚══════════════════════════════╝\n";
+
+    // ── Register signal handler ───────────────────────────────────
+    // signal(SIGINT, signalHandler) means:
+    // "when SIGINT arrives (Ctrl+C), call signalHandler() instead of
+    //  the default behaviour (immediate kill)"
+    signal(SIGINT, signalHandler);
 
     int server_fd = createServerSocket(port);
     if (server_fd == -1) return 1;
@@ -277,6 +375,6 @@ int main(int argc, char* argv[])
     runSelectLoop(server_fd);
 
     close(server_fd);
-    std::cout << "[INFO] Server shut down.\n";
+    std::cout << "[INFO] Server shut down cleanly.\n";
     return 0;
 }

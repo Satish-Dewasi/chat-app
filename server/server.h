@@ -8,31 +8,38 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <sys/select.h>    // select(), fd_set, FD_SET, FD_ISSET, FD_ZERO
-
-// NEW in Phase 3 — we need a data structure to track all connected clients
-// vector = dynamic array — grows as clients connect, shrinks when they leave
+#include <sys/select.h>
 #include <vector>
+#include <map>       // NEW: maps fd → username  e.g. {4:"Alice", 5:"Bob"}
+#include <csignal>   // NEW: signal(), SIGINT — for Ctrl+C handling
 
 #include "../common/message.h"
 
-// Maximum number of simultaneous clients we support
-// select() has a system limit (FD_SETSIZE = 1024 on Linux)
-// We cap at 10 for this project — plenty for a demo
-#define MAX_CLIENTS 10
+// ── Global state ───────────────────────────────────────────────────
+// volatile: tells compiler "this can change outside normal code flow"
+//           (signal handlers run asynchronously — compiler must not
+//            cache this variable in a register)
+// sig_atomic_t: a type guaranteed to be read/written atomically
+//               safe to use in signal handlers
+extern volatile sig_atomic_t g_running;
 
-// ── Function declarations ──────────────────────────────────────────────────
-
-// Same as Phase 1 — creates and returns configured server socket
+// ── Function declarations ──────────────────────────────────────────
 int  createServerSocket(int port);
 
-// NEW — replaces runPhase1Loop()
-// The full select() event loop — handles many clients simultaneously
-void runSelectLoop(int server_fd);
+// NEW: send ALL bytes — retries if send() delivers less than requested
+// Returns true if all bytes sent, false on error
+bool sendAll(int fd, const std::string& message);
 
-// NEW — broadcasts a message to all clients EXCEPT the sender
-void broadcastMessage(const std::vector<int>& client_fds,
-                      int                     sender_fd,
-                      const std::string&      message);
+// UPGRADED: now uses username map instead of fd numbers
+void broadcastMessage(const std::vector<int>&        client_fds,
+                      const std::map<int,std::string>& usernames,
+                      int                              sender_fd,
+                      const std::string&               message);
+
+// NEW: signal handler — called when user presses Ctrl+C
+void signalHandler(int signal);
+
+// UPGRADED: full Phase 5 loop with username handshake + robust send
+void runSelectLoop(int server_fd);
 
 #endif // SERVER_H
